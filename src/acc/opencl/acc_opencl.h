@@ -46,8 +46,18 @@
 #if !defined(ACC_OPENCL_BUFFERSIZE)
 # define ACC_OPENCL_BUFFERSIZE (8 << 10/*8KB*/)
 #endif
+#if !defined(ACC_OPENCL_KERNELNAME_MAXSIZE)
+# define ACC_OPENCL_KERNELNAME_MAXSIZE 48
+#endif
 #if !defined(ACC_OPENCL_DEVICES_MAXCOUNT)
 # define ACC_OPENCL_DEVICES_MAXCOUNT 256
+#endif
+#if !defined(ACC_OPENCL_OVERMALLOC)
+# if defined(__DBCSR_ACC)
+#   define ACC_OPENCL_OVERMALLOC 0
+# else
+#   define ACC_OPENCL_OVERMALLOC 8192
+# endif
 #endif
 
 /* can depend on OpenCL implementation */
@@ -72,7 +82,7 @@
 # define ACC_OPENCL_EVENT(A) ((cl_event*)(A))
 #endif
 
-#if !defined(ACC_OPENCL_THREADLOCAL_CONTEXT) && /*WORKAROUND*/!defined(__DBCSR_ACC) && 0
+#if !defined(ACC_OPENCL_THREADLOCAL_CONTEXT) && 0
 # define ACC_OPENCL_THREADLOCAL_CONTEXT
 #endif
 #if !defined(ACC_OPENCL_STREAM_PRIORITIES) && 1
@@ -183,8 +193,14 @@ typedef struct c_dbcsr_acc_opencl_config_t {
   cl_bool async_memops;
   /** Runtime SVM support (needs ACC_OPENCL_SVM at compile-time). */
   cl_bool svm_interop;
-  /** Runtime verbosity (output on stderr). */
+  /** Whether host memory is unified or not. */
+  cl_bool unified;
+  /** Intel device ID (zero if non-Intel). */
+  cl_int intel_id;
+  /** Verbosity level (output on stderr). */
   cl_int verbosity;
+  /** Dump level (debug). */
+  cl_int dump;
 } c_dbcsr_acc_opencl_config_t;
 
 extern c_dbcsr_acc_opencl_config_t c_dbcsr_acc_opencl_config;
@@ -211,16 +227,18 @@ int c_dbcsr_acc_opencl_info_devmem(cl_device_id device,
   size_t* mem_free, size_t* mem_total, size_t* mem_local,
   int* mem_unified);
 /** Return the pointer to the 1st match of "b" in "a", or NULL (no match). */
-const char* c_dbcsr_acc_opencl_stristr(const char* a, const char* b);
+const char* c_dbcsr_acc_opencl_stristr(const char a[], const char b[]);
 /** Get active device (can be thread/queue-specific). */
 int c_dbcsr_acc_opencl_device(void* stream, cl_device_id* device);
 /** Confirm the vendor of the given device. */
-int c_dbcsr_acc_opencl_device_vendor(cl_device_id device, const char* vendor);
-/** Confirm the name of the given device. */
-int c_dbcsr_acc_opencl_device_name(cl_device_id device, const char* name);
+int c_dbcsr_acc_opencl_device_vendor(cl_device_id device, const char vendor[]);
+/** Confirm that match is matching the name of the given device. */
+int c_dbcsr_acc_opencl_device_name(cl_device_id device, const char match[]);
+/** Capture an id out of the device-name according to the given format (scanf). */
+int c_dbcsr_acc_opencl_device_id(cl_device_id device, const char format[], int* id);
 /** Return the OpenCL support level for the given device. */
 int c_dbcsr_acc_opencl_device_level(cl_device_id device,
-  int* level_major, int* level_minor);
+  int* level_major, int* level_minor, char cl_std[16]);
 /** Check if given device supports the extensions. */
 int c_dbcsr_acc_opencl_device_ext(cl_device_id device,
   const char *const extnames[], int num_exts);
@@ -229,11 +247,18 @@ int c_dbcsr_acc_opencl_set_active_device(int device_id, cl_device_id* device);
 /** Get preferred multiple and max. size of workgroup (kernel- or device-specific). */
 int c_dbcsr_acc_opencl_wgsize(cl_device_id device, cl_kernel kernel,
   int* max_value, int* preferred_multiple);
-/** Build kernel function with given name from source using given build_options. */
-int c_dbcsr_acc_opencl_kernel(const char* source, const char* build_options,
-  const char* kernel_name, cl_kernel* kernel);
+/**
+ * Build kernel from source with given kernel_name, build_params and build_options.
+ * The build_params are meant to instantiate the kernel (-D) whereas build_options
+ * are are meant to be compiler-flags.
+ */
+int c_dbcsr_acc_opencl_kernel(const char source[], const char kernel_name[],
+  const char build_params[], const char build_options[],
+  const char try_build_options[], int* try_ok,
+  const char *const extnames[], int num_exts,
+  cl_kernel* kernel);
 /** Create command queue (stream). */
-int c_dbcsr_acc_opencl_stream_create(cl_command_queue* stream_p, const char* name,
+int c_dbcsr_acc_opencl_stream_create(cl_command_queue* stream_p, const char name[],
   const ACC_OPENCL_COMMAND_QUEUE_PROPERTIES* properties);
 /** Enqueue barrier (see c_dbcsr_acc_opencl_config.record_event). */
 int c_dbcsr_acc_opencl_enqueue_barrier(void* event, void* stream);

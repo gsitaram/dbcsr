@@ -6,57 +6,136 @@
  * For further information please visit https://dbcsr.cp2k.org                                    *
  * SPDX-License-Identifier: GPL-2.0+                                                              *
  *------------------------------------------------------------------------------------------------*/
+#if (200/*CL_VERSION_2_0*/ <= __OPENCL_VERSION__) || defined(__NV_CL_C_VERSION)
+# define UNROLL_FORCE(N) __attribute__((opencl_unroll_hint(N)))
+#else
+# define UNROLL_FORCE(N)
+#endif
+#if !defined(UNROLL)
+# define UNROLL(N)
+#endif
+#if !defined(UNROLL_SM)
+# define UNROLL_SM UNROLL(SM)
+#endif
 
-/* number of M-blocks */
+#if (1 == TN)
+# define ZERO 0.f
+#elif (3 == TN)
+# define ZERO 0.0
+#else
+# define ZERO 0
+#endif
+
+#if !defined(TRACK_B) && (1 < BS) && 0
+# if defined(GPRF_B) && !defined(SLM_B)
+#   define TRACK_B
+# endif
+#endif
+#if !defined(TRACK_C) && (1 < BS) && 1
+# define TRACK_C
+#endif
+
+#if defined(SLM_P) && (1 < BS)
+# define IDXBASE 0
+#else
+# define IDXBASE 1
+#endif
+
 #define NBM ((SM + BM - 1) / BM)
-/* number of N-blocks */
 #define NBN ((SN + BN - 1) / BN)
-/* size of workgroup (WG) */
-#define SWG (NBM * NBN)
+#define NBK (NBM * NBN)
 
 
-#if !defined(cl_intel_global_float_atomics)
+#if !defined(cl_intel_global_float_atomics) || (1 != TN)
+#if !defined(cl_khr_int64_base_atomics) && (1 != TN)
+__attribute__((always_inline))
+inline void atomic32_add64_global(global volatile double* dst, double inc)
+{
+  *dst += inc; /* TODO */
+}
+#endif
 
+#if defined(CMPXCHG)
 __attribute__((always_inline))
 inline void atomic_add_global_cmpxchg(global volatile T* dst, T inc)
 {
-  union { T f; TA a; } old_val, try_val, new_val = { .f = *dst };
+#if defined(cl_khr_int64_base_atomics) || (1 == TN)
+  union { T f; TA a; } exp_val, try_val, cur_val = { .f = *dst };
   do {
-    old_val.a = new_val.a;
-    try_val.f = old_val.f + inc;
-    new_val.a = CMPXCHG((global volatile TA*)dst, old_val.a, try_val.a);
-  } while (old_val.a != new_val.a);
+    exp_val.a = cur_val.a; try_val.f = exp_val.f + inc;
+# if defined(TM)
+    if (0 == atomic_compare_exchange_weak_explicit(
+        (global volatile TM*)dst, &cur_val.a, try_val.a,
+        memory_order_relaxed, memory_order_relaxed,
+      memory_scope_work_group)) continue;
+# else
+    cur_val.a = CMPXCHG((global volatile TA*)dst, exp_val.a, try_val.a);
+# endif
+  } while (cur_val.a != exp_val.a);
+#else
+  atomic32_add64_global(dst, inc);
+#endif
 }
+#endif
 
+#if defined(ATOMIC_ADD2_GLOBAL) && (1 == TN)
+__attribute__((always_inline))
+inline void atomic_add_global_cmpxchg2(global volatile float* dst, float2 inc)
+{
+  union { float2 f; long a; } exp_val, try_val, cur_val = { .f = (float2)(dst[0], dst[1]) };
+  do {
+    exp_val.a = cur_val.a; try_val.f = exp_val.f + inc;
+# if defined(TM)
+    if (0 == atomic_compare_exchange_weak_explicit(
+        (global volatile atomic_long*)dst, &cur_val.a, try_val.a,
+        memory_order_relaxed, memory_order_relaxed,
+      memory_scope_work_group)) continue;
+# else
+    cur_val.a = atom_cmpxchg((global volatile long*)dst, exp_val.a, try_val.a);
+# endif
+  } while (cur_val.a != exp_val.a);
+}
+#endif
+
+#if defined(XCHG) || (defined(__NV_CL_C_VERSION) && !defined(CMPXCHG))
 __attribute__((always_inline))
 inline void atomic_add_global_xchg(global volatile T* dst, T inc)
 {
-  union { T f; TA a; } old_val = { .f = inc }, try_val, new_val = { .f = 0 };
+#if defined(cl_khr_int64_base_atomics) || (1 == TN)
+# if (defined(__NV_CL_C_VERSION) && !defined(XCHG)) && (1 == TN)
+  asm("{ .reg .f32 t; atom.global.add.f32 t, [%0], %1; }" :: "l"(dst), "f"(inc));
+# elif (defined(__NV_CL_C_VERSION) && !defined(XCHG)) && (3 == TN)
+  asm("{ .reg .f64 t; atom.global.add.f64 t, [%0], %1; }" :: "l"(dst), "d"(inc));
+# else
+  union { T f; TA a; } exp_val = { .f = inc }, try_val, cur_val = { .f = 0 };
   do {
-    try_val.a = XCHG((global volatile TA*)dst, new_val.a);
-    try_val.f += old_val.f;
-    old_val.a = XCHG((global volatile TA*)dst, try_val.a);
-  } while (old_val.a != new_val.a);
-}
-
-#if defined(ATOMIC_ADD2_GLOBAL)
-__attribute__((always_inline))
-inline void atomic_add_global_cmpxchg2(global volatile float2* dst, float2 inc)
-{
-  union { float2 f; long a; } old_val, try_val, new_val = { .f = *dst };
-  do {
-    old_val.a = new_val.a;
-    try_val.f = old_val.f + inc;
-    new_val.a = atom_cmpxchg((global volatile long*)dst, old_val.a, try_val.a);
-  } while (old_val.a != new_val.a);
+#   if defined(TM)
+    try_val.a = atomic_exchange_explicit((global volatile TM*)dst, cur_val.a,
+      memory_order_relaxed, memory_scope_work_group);
+#   else
+    try_val.a = XCHG((global volatile TA*)dst, cur_val.a);
+#   endif
+    try_val.f += exp_val.f;
+#   if defined(TM)
+    exp_val.a = atomic_exchange_explicit((global volatile TM*)dst, try_val.a,
+      memory_order_relaxed, memory_scope_work_group);
+#   else
+    exp_val.a = XCHG((global volatile TA*)dst, try_val.a);
+#   endif
+  } while (cur_val.a != exp_val.a);
+# endif
+#else
+  atomic32_add64_global(dst, inc);
+#endif
 }
 #endif
-
 #endif
 
 
+__attribute__((reqd_work_group_size(SWG, 1, 1)))
 kernel void FN(global T *restrict cdata,
   GLOBAL const T *restrict adata, GLOBAL const T *restrict bdata,
+  /* indexes given by param_stack are one-based (Fortran) */
 #if (1 < BS)
   GLOBAL const int *restrict param_stack, int stack_size)
 #else
@@ -64,129 +143,299 @@ kernel void FN(global T *restrict cdata,
 #endif
 {
   const int gid = get_group_id(0), idx = get_local_id(0);
-  GLOBAL const int *const restrict params = param_stack + gid * (3 * BS);
-  /* indexes given by param_stack are one-based */
-  int c0 = params[2] - 1;
-#if (1 < BS)
-  int b1 = -1;
+  GLOBAL const int *restrict pbase = param_stack + gid * (3 * BS);
+#if defined(SLM_P) && (1 < BS)
+  local int params[3*BS];
+#else
+  GLOBAL const int *restrict params = pbase;
 #endif
-  global T *restrict c = cdata + c0;
-
+#if defined(SLM_A)
+  local T amk[SM][SK+SLM_A-1];
+#elif defined(GPRF_A)
   T amk[SK];
-#if (SWG != SN)
+#endif
+#if defined(SLM_B)
+  local T bkn[SK][SN+SLM_B-1];
+#endif
+#if (BM < SM || 1 != BN)
+# if defined(GPRF_B) && !defined(SLM_B)
   T bkn[SK][BN];
-# if (1 < BS)
+# endif
+# if !defined(SLM_C) && (1 < BS)
   T cmn[BM][BN] = {{ 0 }};
 # endif
+  const int m0 = (idx / NBN) * BM, n0 = (idx % NBN) * BN;
 #else
-  local T awg[SM][SK];
+# if defined(GPRF_B) && !defined(SLM_B)
   T bkn[SK];
-# if (1 < BS)
+# endif
+# if !defined(SLM_C) && (1 < BS)
   T cmn[SM] = { 0 };
 # endif
+#endif
+#if defined(TRACK_B)
+  int b1 = -1;
 #endif
 
   /* intra-kernel mini-batch of SMMs */
 #if (1 < BS)
   const int batchsize = min(BS, stack_size - BS * gid);
-  for (int i = 0; i < batchsize; ++i)
-#endif
+  global T *restrict c;
+  int c0, i;
+# if defined(SLM_C)
+  local T cmn[SM][SN+SLM_C-1];
+  for (int m = idx; m < SM; m += SWG) {
+    UNROLL_FORCE(SN)
+    for (int n = 0; n < SN; ++n) cmn[m][n] = ZERO;
+  }
+# endif
+# if defined(SLM_P)
+  for (i = idx; i < (3 * batchsize); i += SWG) params[i] = pbase[i] - 1;
+# endif
+# if (defined(SLM_C) || defined(SLM_P)) && !defined(NOBARRIER)
+  barrier(CLK_LOCAL_MEM_FENCE);
+# endif
+# if (NBK < SWG)
+  if (NBK <= idx) return;
+# endif
+  c0 = params[2] - IDXBASE;
+  c = cdata + c0;
+  UNROLL_FORCE(1)
+  for (i = 0; i < batchsize; ++i) {
+    const int a0 = params[3*i] - IDXBASE, b0 = params[3*i+1] - IDXBASE;
+    const int c1 = ((i + 1) < batchsize ? (params[3*i+5] - IDXBASE) : -1);
+#else
+# if (NBK < SWG)
+  if (NBK > idx)
+# endif
   {
-#if (SWG != SN)
-    const int im = idx / NBN;
-    const int m0 = im * BM, m1 = min(m0 + BM, SM);
-    const int n0 = (idx - im * NBN) * BN;
-    const int n1 = min(n0 + BN, SN);
-#else
-    const int bm = (SM + SN - 1) / SN;
-    const int m0 = idx * bm, m1 = min(m0 + bm, SM);
-    const int n = idx;
-#endif
-#if (1 < BS)
-    const int c1 = (i < (batchsize - 1) ? (params[3*i+5] - 1) : -1);
-    const int a0 = params[3*i+0] - 1, b0 = params[3*i+1] - 1;
-#else
-    const int a0 = params[0] - 1, b0 = params[1] - 1;
+    const int a0 = params[0] - IDXBASE, b0 = params[1] - IDXBASE;
+    global T *restrict c = cdata + params[2] - IDXBASE;
 #endif
     GLOBAL const T *const restrict a = adata + a0;
+    GLOBAL const T *const restrict b = bdata + b0;
 
-#if (SWG == SN)
-    /* transpose A-matrix into local buffer */
-    for (int m = m0; m < m1; ++m) {
-      for (int k = 0; k < SK; ++k) awg[m][k] = a[SM*k+m];
+#if defined(SLM_A)
+    /* transpose A-matrix into local/shared buffer */
+    int m = idx;
+# if (NBK != SM)
+    for (; m < SM; m += NBK)
+# endif
+    { UNROLL_FORCE(SK)
+      for (int k = 0; k < SK; ++k) amk[m][k] = a[SM*k+m];
     }
 #endif
 
-    /* avoiding to load same B-tile seems to be not beneficial */
-#if (1 < BS) && 0
-    if (b0 != b1)
-#endif
-    { /* copy B-matrix into private buffer */
-      GLOBAL const T *const restrict b = bdata + b0;
-      for (int k = 0; k < SK; ++k) {
-#if (SWG != SN)
-        for (int n = n0; n < n1; ++n) bkn[k][n-n0] = b[SN*k+n];
-#else
-        bkn[k] = b[SN*k+n];
-#endif
-      }
-#if (1 < BS)
+#if defined(SLM_B)
+    UNROLL(SK)
+    for (int k = 0; k < SK; ++k) {
+      int n = idx;
+# if (NBK != SN)
+      for (; n < SN; n += NBK)
+# endif
+      bkn[k][n] = b[SN*k+n];
+    }
+#elif defined(GPRF_B)
+# if defined(TRACK_B) && (1 < BS)
+    if (b0 != b1) {
       b1 = b0;
-#endif
-    }
-
-    /* calculate private result-tile */
-#if (SWG != SN)
-    for (int m = m0; m < m1; ++m) {
-      for (int k = 0; k < SK; ++k) amk[k] = a[SM*k+m];
-      for (int n = n0; n < n1; ++n) {
-        T r = 0;
-        for (int k = 0; k < SK; ++k) r = FMA(amk[k], bkn[k][n-n0], r);
-# if (1 < BS)
-        cmn[m-m0][n-n0] += r;
 # else
-        if (0 != r) ATOMIC_ADD_GLOBAL(&c[SM*n+m], r);
+    { /* copy B-matrix into private buffer */
+# endif
+      UNROLL(SK)
+      for (int k = 0; k < SK; ++k) {
+# if (BM < SM || 1 != BN)
+        UNROLL_FORCE(BN)
+        for (int bn = 0; bn < BN; ++bn) {
+#   if (SN % BN)
+          const int n = min(bn + n0, SN - 1);
+#   else
+          const int n = bn + n0;
+#   endif
+          bkn[k][bn] = b[SN*k+n];
+        }
+# else
+        bkn[k] = b[SN*k+idx];
 # endif
       }
     }
-#else
+#endif
+
+#if (defined(SLM_A) || defined(SLM_B)) && (1 < NBK) && !defined(NOBARRIER)
+    /* finish transpose/copy */
     barrier(CLK_LOCAL_MEM_FENCE);
-    for (int m = 0; m < SM; ++m) {
-      T r = 0;
-      for (int k = 0; k < SK; ++k) amk[k] = awg[m][k];
-      for (int k = 0; k < SK; ++k) r = FMA(amk[k], bkn[k], r);
+#endif
+
+#if (BM < SM || 1 != BN)
+    /* calculate result-tile using general tiles */
+    UNROLL(BM)
+    for (int bm = 0; bm < BM; ++bm) {
+      const int m = bm + m0;
+# if (SM % BM)
+      if (m < SM)
+# endif
+      {
+# if defined(GPRF_A) && !defined(SLM_A)
+        UNROLL_FORCE(SK)
+        for (int k = 0; k < SK; ++k) amk[k] = a[SM*k+m];
+# endif
+        UNROLL(BN)
+        for (int bn = 0; bn < BN; ++bn) {
+          const int n = bn + n0;
+# if (SN % BN)
+          if (n < SN)
+# endif
+          {
 # if (1 < BS)
-      cmn[m] += r;
+#   if defined(SLM_C)
+            local T *restrict r = &cmn[m][n];
+#   else
+            T *restrict r = &cmn[bm][bn];
+#   endif
 # else
-      if (0 != r) ATOMIC_ADD_GLOBAL(&c[SM*n+m], r);
+            T s = ZERO, *restrict r = &s;
+# endif
+            UNROLL_FORCE(SK)
+            for (int k = 0; k < SK; ++k) *r = MAD(
+# if defined(SLM_A)
+              amk[m][k],
+# elif defined(GPRF_A)
+              amk[k],
+# else
+              a[SM*k+m],
+# endif
+# if defined(SLM_B)
+              bkn[k][n],
+# elif defined(GPRF_B)
+              bkn[k][bn],
+# else
+              b[SN*k+n],
+# endif
+              *r);
+# if (1 == BS)
+#   if defined(ATOMIC_INC_NZ)
+            if (ZERO != *r)
+#   endif
+            ATOMIC_ADD_GLOBAL(&c[SM*n+m], *r);
+# endif
+          }
+        }
+      }
+    }
+#else
+    /* calculate result-tile using columns */
+    UNROLL_SM
+    for (int m = 0; m < SM; ++m) {
+# if (1 < BS)
+#   if defined(SLM_C)
+      local T *restrict r = &cmn[m][idx];
+#   else
+      T *restrict r = &cmn[m];
+#   endif
+# else
+      T s = ZERO, *restrict r = &s;
+# endif
+# if defined(GPRF_A) && !defined(SLM_A)
+      UNROLL_FORCE(SK)
+      for (int k = 0; k < SK; ++k) amk[k] = a[SM*k+m];
+# endif
+      UNROLL_FORCE(SK)
+      for (int k = 0; k < SK; ++k) *r = MAD(
+# if defined(SLM_A)
+        amk[m][k],
+# elif defined(GPRF_A)
+        amk[k],
+# else
+        a[SM*k+m],
+# endif
+# if defined(SLM_B)
+        bkn[k][idx],
+# elif defined(GPRF_B)
+        bkn[k],
+# else
+        b[SN*k+idx],
+# endif
+        *r);
+# if (1 == BS)
+#   if defined(ATOMIC_INC_NZ)
+      if (ZERO != *r)
+#   endif
+      ATOMIC_ADD_GLOBAL(&c[SM*idx+m], *r);
 # endif
     }
 #endif
 
 #if (1 < BS)
-    if (c0 != c1) { /* copy private tile to global memory */
-# if (SWG != SN)
-      for (int m = 0; m < BM; ++m) for (int n = 0; n < BN; ++n) {
-        const int gm = m + m0, gn = n + n0;
-        if (gm < SM && gn < SN && 0 != cmn[m][n]) {
-          ATOMIC_ADD_GLOBAL(&c[SM*gn+gm], cmn[m][n]);
-          cmn[m][n] = 0; /* reset */
+# if defined(TRACK_C)
+    if (c0 != c1)
+# endif
+# if (BM < SM || 1 != BN)
+    { /* atomically commit C-tile to global memory */
+      UNROLL(BM)
+      for (int bm = 0; bm < BM; ++bm) {
+        const int m = bm + m0;
+#   if (SM % BM)
+        if (m < SM)
+#   endif
+        {
+          UNROLL_FORCE(BN)
+          for (int bn = 0; bn < BN; ++bn) {
+            const int n = bn + n0;
+#   if (SN % BN)
+            if (n < SN)
+#   endif
+            {
+#   if defined(SLM_C)
+              local T *restrict r = &cmn[m][n];
+#   else
+              T *restrict r = &cmn[bm][bn];
+#   endif
+#   if defined(ATOMIC_INC_NZ)
+              if (ZERO != *r)
+#   endif
+              {
+                ATOMIC_ADD_GLOBAL(&c[SM*n+m], *r);
+                *r = ZERO; /* reset */
+              }
+            }
+          }
         }
       }
 # else
+    { /* atomically commit C-column to global memory */
+      int m = 0;
 #   if defined(ATOMIC_ADD2_GLOBAL)
-      for (int m = 0; m < SM; m += 2) {
-        float2 *const restrict r = (float2*)(cmn + m);
-        if (0 != r) {
-          ATOMIC_ADD2_GLOBAL((global volatile float2*)(c + SM * n + m), *r);
-          *r = 0; /* reset */
+      for (; m < (SM - 1); m += 2) {
+#     if defined(SLM_C)
+        local T *restrict r0 = &cmn[m+0][idx];
+        local T *restrict r1 = &cmn[m+1][idx];
+#     else
+        T *restrict r0 = &cmn[m+0];
+        T *restrict r1 = &cmn[m+1];
+#     endif
+#     if defined(ATOMIC_INC_NZ)
+        if (ZERO != *r0 && ZERO != *r1)
+#     endif
+        {
+          const float2 r2 = (float2)(*r0, *r1);
+          ATOMIC_ADD2_GLOBAL(&c[SM*idx+m], r2);
+          *r0 = *r1 = ZERO; /* reset */
         }
       }
-#   else
-      for (int m = 0; m < SM; ++m) {
-        if (0 != cmn[m]) {
-          ATOMIC_ADD_GLOBAL(&c[SM*n+m], cmn[m]);
-          cmn[m] = 0; /* reset */
+#   endif
+#   if !defined(ATOMIC_ADD2_GLOBAL) || (SM & 1)
+      for (; m < SM; ++m) {
+#     if defined(SLM_C)
+        local T *restrict r = &cmn[m][idx];
+#     else
+        T *restrict r = cmn + m;
+#     endif
+#     if defined(ATOMIC_INC_NZ)
+        if (ZERO != *r)
+#     endif
+        {
+          ATOMIC_ADD_GLOBAL(&c[SM*idx+m], *r);
+          *r = ZERO; /* reset */
         }
       }
 #   endif
@@ -195,7 +444,6 @@ kernel void FN(global T *restrict cdata,
       c = cdata + c1;
       c0 = c1;
     }
-    barrier(CLK_LOCAL_MEM_FENCE);
 #endif
   }
 }

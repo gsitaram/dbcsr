@@ -17,7 +17,7 @@ add_fypp_sources(
   acc/dbcsr_acc_init.F
   acc/dbcsr_acc_stream.F
   acc/dbcsr_acc_timings.F
-  acc/hip/dbcsr_hipblas.F
+  acc/hip/dbcsr_hip_profiling.F
   base/dbcsr_base_hooks.F
   base/dbcsr_kinds.F
   base/dbcsr_machine.F
@@ -109,13 +109,13 @@ set(DBCSR_HIP_AND_CUDA_SRCS
     acc/libsmm_acc/libsmm_acc_benchmark.cpp
     acc/libsmm_acc/libsmm_acc_init.cpp
     acc/libsmm_acc/libsmm_acc.cpp
-    acc/cuda/acc_cublas.cpp
-    acc/cuda/acc_dev.cpp
-    acc/cuda/acc_error.cpp
-    acc/cuda/acc_event.cpp
-    acc/cuda/acc_init.cpp
-    acc/cuda/acc_mem.cpp
-    acc/cuda/acc_stream.cpp)
+    acc/cuda_hip/acc_blas.cpp
+    acc/cuda_hip/acc_dev.cpp
+    acc/cuda_hip/acc_error.cpp
+    acc/cuda_hip/acc_event.cpp
+    acc/cuda_hip/acc_init.cpp
+    acc/cuda_hip/acc_mem.cpp
+    acc/cuda_hip/acc_stream.cpp)
 
 set(DBCSR_CUDA_SRCS ${DBCSR_HIP_AND_CUDA_SRCS} acc/cuda/acc_cuda.cpp
                     acc/cuda/dbcsr_cuda_nvtx_cu.cpp)
@@ -237,7 +237,8 @@ if (USE_ACCEL)
             $<$<STREQUAL:${USE_ACCEL},cuda>:ARCH_NUMBER=${ACC_ARCH_NUMBER}>
             $<$<STREQUAL:${USE_ACCEL},hip>:__HIP>
             $<$<STREQUAL:${USE_ACCEL},hip>:ARCH_NUMBER=${ACC_ARCH_NUMBER}>
-            $<$<BOOL:${WITH_CUDA_PROFILING}>:__CUDA_PROFILING>)
+            $<$<BOOL:${WITH_CUDA_PROFILING}>:__CUDA_PROFILING>
+            $<$<BOOL:${WITH_HIP_PROFILING}>:__HIP_PROFILING>)
 
   target_link_libraries(
     dbcsr
@@ -247,6 +248,8 @@ if (USE_ACCEL)
             $<$<BOOL:${WITH_CUDA_PROFILING}>:CUDA::nvToolsExt>
             $<$<STREQUAL:${USE_ACCEL},hip>:roc::hipblas>
             $<$<STREQUAL:${USE_ACCEL},hip>:hip::host>
+            $<$<BOOL:${WITH_HIP_PROFILING}>:roctx64>
+            $<$<BOOL:${WITH_HIP_PROFILING}>:roctracer64>
             $<$<STREQUAL:${USE_ACCEL},opencl>:OpenCL::OpenCL>)
 endif ()
 
@@ -254,8 +257,8 @@ endif ()
 # DBCSR's C API
 if (WITH_C_API)
   # Build the C API as a separate library
-  add_fypp_sources(DBCSR_C_SRCS dbcsr_api_c.F tensors/dbcsr_tensor_api_c.F
-                   tensors/dbcsr_tensor.h)
+  add_fypp_sources(DBCSR_C_SRCS dbcsr.h dbcsr_api_c.F
+                   tensors/dbcsr_tensor_api_c.F tensors/dbcsr_tensor.h)
 
   add_library(dbcsr_c ${DBCSR_C_SRCS})
   set_target_properties(dbcsr_c PROPERTIES LINKER_LANGUAGE Fortran)
@@ -300,7 +303,7 @@ if (WITH_C_API)
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
   install(
-    FILES "${CMAKE_CURRENT_SOURCE_DIR}/dbcsr.h"
+    FILES "${CMAKE_CURRENT_BINARY_DIR}/dbcsr.h"
           "${CMAKE_CURRENT_BINARY_DIR}/tensors/dbcsr_tensor.h"
     COMPONENT C
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
